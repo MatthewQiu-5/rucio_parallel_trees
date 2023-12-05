@@ -2817,3 +2817,41 @@ def list_requests_history(src_rse_ids, dst_rse_ids, states=None, offset=None, li
         stmt = stmt.limit(limit)
     for request in session.execute(stmt).yield_per(500).scalars():
         yield request
+
+
+@transactional_session
+def reset_stale_waiting_requests(day_limit: Optional[int] = 1, *, session: "Session"):
+    """
+    Clear source_rse_id for requests that have been in the waiting state for > day_limit (default=1) days and
+    transition back to preparing state.
+
+    This allows for stale requests that have been in the waiting state for a long time to be able to
+    react to source changes that have occurred in the meantime.
+
+    :param day_limit: The number of days a request must be in the waiting state to be reset.
+    :param session: The database session in use.
+    """
+    try:
+        # Cutoff timestamp based on day limit
+        day_limit_timestamp = datetime.datetime.utcnow() - datetime.timedelta(days=day_limit)
+
+        # Select all waiting requests that precede the day limit, then clear source_rse_id and reset state to preparing
+        stmt = update(
+            models.Request
+        ).where(
+            and_(
+                models.Request.state == RequestState.WAITING,
+                models.Request.last_processed_at < day_limit_timestamp
+            )
+        ).execution_options(
+            synchronize_session=False
+        ).values(
+            {
+                models.Request.source_rse_id: None,
+                models.Request.state: RequestState.PREPARING
+            }
+        )
+        session.execute(stmt)
+
+    except IntegrityError as error:
+        raise RucioException(error.args)
