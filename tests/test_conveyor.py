@@ -745,8 +745,6 @@ def test_preparer_throttler_submitter(rse_factory, did_factory, root_account, fi
     assert request['state'] == RequestState.QUEUED
 
     # Check that resetting stale waiting requests works properly
-
-    # Create new test dids and add rules
     request_core.set_transfer_limit(dst_rse2, max_transfers=1, activity='all_activities', strategy='fifo')
     did3 = did_factory.upload_test_file(src_rse)
     did4 = did_factory.upload_test_file(src_rse)
@@ -787,12 +785,8 @@ def test_preparer_throttler_submitter(rse_factory, did_factory, root_account, fi
     throttler(once=True, partition_wait_time=0)
     request3 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did3)
     request4 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did4)
-    assert (request3['source_rse_id'] is None
-            and request3['state'] == RequestState.PREPARING
-            and request4['state'] == RequestState.QUEUED
-            or request4['source_rse_id'] is None
-            and request4['state'] == RequestState.PREPARING
-            and request3['state'] == RequestState.QUEUED)
+    assert ((request3['source_rse_id'] is None and request3['state'] == RequestState.PREPARING and request4['state'] == RequestState.QUEUED)
+            or (request4['source_rse_id'] is None and request4['state'] == RequestState.PREPARING and request3['state'] == RequestState.QUEUED))
 
 
 @skip_rse_tests_with_accounts

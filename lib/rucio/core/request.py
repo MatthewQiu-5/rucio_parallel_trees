@@ -2820,7 +2820,7 @@ def list_requests_history(src_rse_ids, dst_rse_ids, states=None, offset=None, li
 
 
 @transactional_session
-def reset_stale_waiting_requests(day_limit: Optional[int] = 1, *, session: "Session"):
+def reset_stale_waiting_requests(day_limit: Optional[int] = 1, *, session: "Session") -> None:
     """
     Clear source_rse_id for requests that have been in the waiting state for > day_limit (default=1) days and
     transition back to preparing state.
