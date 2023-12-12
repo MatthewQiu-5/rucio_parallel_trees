@@ -25,7 +25,7 @@ import uuid
 from collections import namedtuple, defaultdict
 from collections.abc import Sequence, Mapping, Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, Tuple, Dict, List
 
 from sqlalchemy import and_, or_, update, select, delete, exists, insert
 from sqlalchemy.exc import IntegrityError
@@ -2817,3 +2817,137 @@ def list_requests_history(src_rse_ids, dst_rse_ids, states=None, offset=None, li
         stmt = stmt.limit(limit)
     for request in session.execute(stmt).yield_per(500).scalars():
         yield request
+
+
+@transactional_session
+def reset_stale_waiting_requests(time_limit: Optional[datetime.timedelta] = datetime.timedelta(days=1), *, session: "Session") -> None:
+    """
+    Clear source_rse_id for requests that have been in the waiting state for > time_limit amount of time and
+    transition back to preparing state (default time limit = 1 day).
+    This allows for stale requests that have been in the waiting state for a long time to be able to
+    react to source changes that have occurred in the meantime.
+    :param time_limit: The amount of time a request must be in the waiting state to be reset.
+    :param session: The database session in use.
+    """
+    try:
+        # Cutoff timestamp based on time limit
+        time_limit_timestamp = datetime.datetime.utcnow() - time_limit
+
+        # Select all waiting requests that precede the time limit, then clear source_rse_id and reset state to preparing
+        stmt = update(
+            models.Request
+        ).where(
+            and_(
+                models.Request.state == RequestState.WAITING,
+                models.Request.last_processed_at < time_limit_timestamp
+            )
+        ).execution_options(
+            synchronize_session=False
+        ).values(
+            {
+                models.Request.source_rse_id: None,
+                models.Request.state: RequestState.PREPARING
+            }
+        )
+        session.execute(stmt)
+
+    except IntegrityError as error:
+        raise RucioException(error.args)
+
+
+@read_session
+def get_batched_request_groups_by_did(
+        total_workers: int,
+        worker_number: int,
+        partition_hash_var,
+        *,
+        session: "Session",
+) -> dict[Tuple[Any,Any], List[models.Request]]:
+    """
+    Queries the database for all requests in the BATCHED_FILTERING state and groups them by DID,
+    returning a dictionary keyed by DID.
+    :param total_workers: Number of total workers.
+    :param worker_number: Id of the executing worker.
+    :param partition_hash_var: The hash variable used for partitioning thread work
+    :param session: The database session in use.
+    :return: List of request groups, grouped by DID
+    """
+
+    try:
+        # Get all requests in BATCHED_FILTERING state
+        stmt = select(
+            models.Request
+        ).where(
+            models.Request.state == RequestState.BATCH_FILTERING,
+        ).execution_options(
+            synchronize_session=False
+        ).order_by(
+            models.Request.requested_at
+        )
+        requests = session.execute(stmt).all()
+        # Create request groups from query
+        request_groups = {}
+        for request in requests:
+            request = request[0]
+            did = (request.name, request.scope)
+            if did in request_groups:
+                request_groups[did].append(request)
+            else:
+                request_groups[did] = [request]
+        return request_groups
+
+    except IntegrityError as error:
+        raise RucioException(error.args)
+
+
+@transactional_session
+def filter_request_groups(
+        request_groups,
+        threshold: float=0.25,
+        minimum_batch_size: int=10,
+        *,
+        session: "Session",
+):
+    """
+        Takes request groups and lets some of them through to the throttler while resetting the filtered requests
+        to the PREPARING state.
+        :param request_groups: dictionary of requests in the BATCH_FILTERING state, keyed by the DID
+        :param threshold: The percentage of requests of the same DID allowed to be active in the conveyor at any given time
+        :param minimum_batch_size: The minimum number of requests for the threshold to be applied
+        :param session: The database session in use.
+        :return reset_count, filter_count: Two-item tuple about the number of requests reset and the number that
+            were allowed through.
+    """
+
+    included_states = (RequestState.WAITING, RequestState.QUEUED, RequestState.SUBMITTING, RequestState.SUBMITTED)
+    for did in request_groups.keys():
+        did_name = did[0]
+        did_scope = did[1]
+
+        try:
+            past_filterer_count = session.query(
+                models.Request
+            ).filter(
+                and_(
+                    models.Request.name == did_name,
+                    models.Request.scope == did_scope,
+                    models.Request.state.in_(included_states)
+                )
+            ).count()
+        except IntegrityError as error:
+            raise RucioException(error.args)
+
+        if len(request_groups[did]) < minimum_batch_size:
+            allowed_submissions = len(request_groups[did])
+        elif past_filterer_count == 0 or len(request_groups[did]) > past_filterer_count:
+            allowed_submissions = int(threshold * len(request_groups[did]))
+        else:
+            allowed_submissions = int(threshold * past_filterer_count)
+
+        request_list = request_groups[did]
+        for i, request in enumerate(request_list):
+            if i <= allowed_submissions:
+                request.state = RequestState.WAITING
+            else:
+                request.state = RequestState.PREPARING
+        session.commit()

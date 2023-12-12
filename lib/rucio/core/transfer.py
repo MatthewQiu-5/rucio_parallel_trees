@@ -1494,13 +1494,20 @@ def _throttler_request_state(activity, source_rse, dest_rse, *, session: "Sessio
     Takes request attributes to return a new state for the request
     based on throttler settings. Always returns QUEUED,
     if the throttler mode is not set.
+
+    Sends to BATCH_FILTERING state instead of WAITING if the filterer daemon is enabled
     """
     limit_found = False
     if any(applicable_rse_transfer_limits(activity=activity, source_rse=source_rse, dest_rse=dest_rse, session=session)):
         limit_found = True
 
-    return RequestState.WAITING if limit_found else RequestState.QUEUED
-
+    if limit_found:
+        if config_get('conveyor', 'use_filterer', default=False, raise_exception=False):
+            return RequestState.BATCH_FILTERING
+        else:
+            return RequestState.WAITING
+    else:
+        return RequestState.QUEUED
 
 @read_session
 def get_supported_transfertools(

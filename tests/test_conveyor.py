@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timedelta
 from unittest.mock import patch
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
+from sqlalchemy import update
 
 import pytest
 
@@ -41,6 +42,7 @@ from rucio.daemons.conveyor.preparer import preparer
 from rucio.daemons.conveyor.submitter import submitter
 from rucio.daemons.conveyor.stager import stager
 from rucio.daemons.conveyor.throttler import throttler
+from rucio.daemons.conveyor.filterer import filterer
 from rucio.daemons.conveyor.receiver import receiver, GRACEFUL_STOP as receiver_graceful_stop, Receiver
 from rucio.daemons.reaper.reaper import reaper
 from rucio.db.sqla import models
@@ -743,6 +745,94 @@ def test_preparer_throttler_submitter(rse_factory, did_factory, root_account, fi
     request = request_core.get_request_by_did(rse_id=dst_rse_id1, **waiting_did)
     assert request['state'] == RequestState.QUEUED
 
+    # Check that resetting stale waiting requests works properly
+    request_core.set_transfer_limit(dst_rse2, max_transfers=1, activity='all_activities', strategy='fifo')
+    did3 = did_factory.upload_test_file(src_rse)
+    did4 = did_factory.upload_test_file(src_rse)
+    rule_core.add_rule(dids=[did3], account=root_account, copies=1, rse_expression=dst_rse2, grouping='ALL',
+                       weight=None, lifetime=3600, locked=False, subscription_id=None)
+    rule_core.add_rule(dids=[did4], account=root_account, copies=1, rse_expression=dst_rse2, grouping='ALL',
+                       weight=None, lifetime=3600, locked=False, subscription_id=None)
+    request3 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did3)
+    request4 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did4)
+    assert request3['state'] == RequestState.PREPARING
+    assert request4['state'] == RequestState.PREPARING
+
+    # Run the preparer so requests are in waiting state
+    preparer(once=True, sleep_time=1, bulk=100, partition_wait_time=0, ignore_availability=False)
+    request3 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did3)
+    request4 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did4)
+    assert request3['state'] == RequestState.WAITING
+    assert request4['state'] == RequestState.WAITING
+
+    # Artificially set both requests' last_processed_at timestamp as >1 day old
+    @transactional_session
+    def __set_process_timestamp(request_ids, timestamp, *, session=None):
+        stmt = update(
+            models.Request
+        ).where(
+            models.Request.id.in_(request_ids)
+        ).values(
+            {
+                models.Request.last_processed_at: timestamp
+            }
+        )
+        session.execute(stmt)
+
+    __set_process_timestamp([request['id'] for request in [request3, request4]], datetime.utcnow() - timedelta(days=2))
+
+    # Run throttler: one request reset to PREPARING state and Null source_rse_id, and one request QUEUED
+    throttler(once=True, partition_wait_time=0)
+    request3 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did3)
+    request4 = request_core.get_request_by_did(rse_id=dst_rse_id2, **did4)
+
+    assert ((request3['source_rse_id'] is None and request3['state'] == RequestState.PREPARING and request4['state'] == RequestState.QUEUED)
+            or (request4['source_rse_id'] is None and request4['state'] == RequestState.PREPARING and request3['state'] == RequestState.QUEUED))
+
+
+@skip_rse_tests_with_accounts
+@pytest.mark.noparallel(groups=[NoParallelGroups.PREPARER, NoParallelGroups.THROTTLER, NoParallelGroups.SUBMITTER, NoParallelGroups.POLLER])
+@pytest.mark.parametrize("file_config_mock", [{
+    "overrides": [('conveyor', 'use_preparer', 'true')]
+}], indirect=True)
+def test_batch_filterer(rse_factory, did_factory, root_account, file_config_mock, metrics_mock):
+    src_rse, src_rse_id = rse_factory.make_rse(scheme='mock', protocol_impl='rucio.rse.protocols.posix.Default')
+    dst_rse1, dst_rse_id1 = rse_factory.make_rse(scheme='mock', protocol_impl='rucio.rse.protocols.posix.Default')
+    dst_rse2, dst_rse_id2 = rse_factory.make_rse(scheme='mock', protocol_impl='rucio.rse.protocols.posix.Default')
+    all_rses = [src_rse_id, dst_rse_id1, dst_rse_id2]
+
+    for rse_id in all_rses:
+        rse_core.add_rse_attribute(rse_id, 'fts', TEST_FTS_HOST)
+    distance_core.add_distance(src_rse_id, dst_rse_id1, distance=10)
+    distance_core.add_distance(src_rse_id, dst_rse_id2, distance=10)
+    # Set limits only for one of the RSEs
+    request_core.set_transfer_limit(dst_rse1, max_transfers=1, activity='all_activities', strategy='fifo')
+
+    did1 = did_factory.upload_test_file(src_rse)
+    did2 = did_factory.upload_test_file(src_rse)
+    rule_core.add_rule(dids=[did1], account=root_account, copies=1, rse_expression=dst_rse1, grouping='ALL', weight=None, lifetime=3600, locked=False, subscription_id=None)
+    rule_core.add_rule(dids=[did2], account=root_account, copies=1, rse_expression=dst_rse1, grouping='ALL', weight=None, lifetime=3600, locked=False, subscription_id=None)
+    rule_core.add_rule(dids=[did1], account=root_account, copies=1, rse_expression=dst_rse2, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
+
+    request = request_core.get_request_by_did(rse_id=dst_rse_id1, **did1)
+    assert request['state'] == RequestState.PREPARING
+    request = request_core.get_request_by_did(rse_id=dst_rse_id1, **did2)
+    assert request['state'] == RequestState.PREPARING
+    request = request_core.get_request_by_did(rse_id=dst_rse_id2, **did1)
+    assert request['state'] == RequestState.PREPARING
+
+    # One RSE has limits set: the 2 throttled requests go to the BATCH_FILTERING state
+    preparer(once=True, sleep_time=1, bulk=100, partition_wait_time=0, ignore_availability=False)
+    request = request_core.get_request_by_did(rse_id=dst_rse_id1, **did1)
+    assert request['state'] == RequestState.BATCH_FILTERING
+    request = request_core.get_request_by_did(rse_id=dst_rse_id1, **did2)
+    assert request['state'] == RequestState.BATCH_FILTERING
+
+    filterer(once=True)
+    # request = request_core.get_request_by_did(rse_id=dst_rse_id1, **did1)
+    # assert request['state'] == RequestState.WAITING
+    # request = request_core.get_request_by_did(rse_id=dst_rse_id1, **did2)
+    # assert request['state'] == RequestState.WAITING
 
 @skip_rse_tests_with_accounts
 @pytest.mark.dirty(reason="leaves files in XRD containers")

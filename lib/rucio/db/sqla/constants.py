@@ -136,6 +136,7 @@ class RequestState(Enum):
     SUSPEND = 'U'
     WAITING = 'W'
     PREPARING = 'P'
+    BATCH_FILTERING = 'B'
 
 
 class RequestType(Enum):

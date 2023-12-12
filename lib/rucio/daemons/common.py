@@ -350,7 +350,6 @@ class ProducerConsumerDaemon(Generic[T]):
                 self.queue.task_done()
 
     def run(self):
-
         producer_threads = []
         for i, producer in enumerate(self.producers):
             thread = threading.Thread(
@@ -375,7 +374,6 @@ class ProducerConsumerDaemon(Generic[T]):
             )
             thread.start()
             consumer_threads.append(thread)
-
         logging.info('waiting for interrupts')
 
         while producer_threads:
