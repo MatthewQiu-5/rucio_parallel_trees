@@ -1944,3 +1944,10 @@ def retrying(
                 time.sleep(wait_fixed / 1000.0)
         return _wrapper
     return _decorator
+
+def current_dt() -> datetime:
+    """
+    Function that returns the current datetime
+    :return:
+    """
+    return datetime.datetime.now()

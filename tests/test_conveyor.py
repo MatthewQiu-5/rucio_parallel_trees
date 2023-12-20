@@ -15,6 +15,7 @@
 import logging
 import threading
 import time
+import random
 from datetime import datetime, timedelta
 from unittest.mock import patch
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
@@ -654,6 +655,65 @@ def test_receiver_archiving(vo, did_factory, root_account, caches_mock, scitags_
             receiver_graceful_stop.set()
             receiver_thread.join(timeout=5)
             receiver_graceful_stop.clear()
+
+
+@skip_rse_tests_with_accounts
+@pytest.mark.noparallel(groups=[NoParallelGroups.PREPARER, NoParallelGroups.THROTTLER, NoParallelGroups.SUBMITTER, NoParallelGroups.POLLER])
+@pytest.mark.parametrize("file_config_mock", [{
+    "overrides": [('conveyor', 'use_preparer', 'true')]
+}], indirect=True)
+def test_resubmission_metrics(rse_factory, did_factory, root_account, file_config_mock, metrics_mock):
+    """
+    Test the resubmission algorithm to determine throughput changes
+    """
+
+    # Create source
+    src_rse, src_rse_id = rse_factory.make_rse(scheme='mock', protocol_impl='rucio.rse.protocols.posix.Default')
+    rse_core.add_rse_attribute(src_rse_id, 'fts', TEST_FTS_HOST)
+
+    # Create destination RSEs
+    dst_rse_list = []
+    dst_rse_id_list = []
+    for i in range(10):
+        new_dst_rse, new_dst_rse_id = rse_factory.make_rse(scheme='mock', protocol_impl='rucio.rse.protocols.posix.Default')
+        dst_rse_list.append(new_dst_rse)
+        dst_rse_id_list.append(new_dst_rse_id)
+        rse_core.add_rse_attribute(new_dst_rse_id, 'fts', TEST_FTS_HOST)
+
+    # Set distances from sources to destination
+    for dst_rse_id in dst_rse_id_list:
+        distance_core.add_distance(src_rse_id, dst_rse_id, distance=random.randint(15,20))
+
+    # Set distances from destinations to each other (shorter)
+    for i in range(len(dst_rse_id_list)):
+        for j in range(i, len(dst_rse_id_list)):
+            src_id = dst_rse_id_list[i]
+            dst_id = dst_rse_id_list[j]
+            distance_core.add_distance(src_id, dst_id, distance=random.randint(1,5))
+
+    # Set transfer limits for all destinations
+    for dst_rse in dst_rse_list:
+        request_core.set_transfer_limit(dst_rse, max_transfers=1, activity='all_activities', strategy='fifo')
+
+    # Create DIDs and send them to source
+    did_list = []
+    for i in range(10):
+        new_did = did_factory.upload_test_file(src_rse)
+        did_list.append(new_did)
+
+    # Add rules so that all files must go from source to destinations
+    for dst_rse in dst_rse_list:
+        rule_core.add_rule(dids=did_list, account=root_account, copies=1, rse_expression=dst_rse, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
+
+    # Run the preparer and throttler conveyor daemons
+    preparer(once=True, sleep_time=10, bulk=100, partition_wait_time=0, ignore_availability=False)
+    throttler(once=True, partition_wait_time=0)
+
+    # Check requests
+    for dst_id in dst_rse_id_list:
+        for did in did_list:
+            request = request_core.get_request_by_did(rse_id=dst_id, **did)
+            print(request['state'])
 
 
 @skip_rse_tests_with_accounts

@@ -52,6 +52,10 @@ class BadPFNStatus(Enum):
     TEMPORARY_UNAVAILABLE = 'T'
     AVAILABLE = 'A'
 
+class CongestionState(Enum):
+    CONGESTION_AVOIDANCE = 'A'
+    LOSS = 'L'
+
 
 class DIDAvailability(Enum):
     LOST = 'L'

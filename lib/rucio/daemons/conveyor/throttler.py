@@ -32,7 +32,7 @@ from rucio.common.logging import setup_logging
 from rucio.core.monitor import MetricManager
 from rucio.core.request import (get_request_stats, release_all_waiting_requests, release_waiting_requests_fifo,
                                 release_waiting_requests_grouped_fifo, set_transfer_limit_stats, re_sync_all_transfer_limits,
-                                reset_stale_waiting_requests)
+                                adjust_resubmission_window, conduct_resubmissions)
 from rucio.core.rse import RseCollection
 from rucio.core.transfer import applicable_rse_transfer_limits
 from rucio.daemons.common import db_workqueue, ProducerConsumerDaemon
@@ -69,6 +69,12 @@ def throttler(
             logger(logging.INFO, 'Throttler thread id is not 0, will sleep. Only thread 0 will work')
             return True, None
 
+        # Resubmit requests before computing release groups and log this
+        resubmissions_completed = conduct_resubmissions()
+        logger(logging.INFO, "Resubmissions done")
+        logger(logging.INFO, f"Throttler did {resubmissions_completed} resubmissions")
+
+
         re_sync_all_transfer_limits()
         rse_collection = RseCollection()
         release_groups = _get_request_stats(rse_collection, logger=logger)
@@ -80,10 +86,10 @@ def throttler(
         logger = logging.log
         logger(logging.INFO, "Throttler - schedule requests")
         try:
-            _handle_requests(release_groups, logger=logger)
+            released_request_count = _handle_requests(release_groups, logger=logger)
+            adjust_resubmission_window(released_request_count, sleep_time)
         except Exception:
             logger(logging.CRITICAL, "Failed to schedule requests, error: %s" % (traceback.format_exc()))
-        reset_stale_waiting_requests()
 
     ProducerConsumerDaemon(
         producers=[_db_producer],
@@ -402,6 +408,8 @@ def _handle_requests(release_groups, logger):
     to the same limit.
     """
 
+    released_request_count = 0
+
     for (source_rse, dest_rse, activity), applicable_limits in release_groups.items():
 
         # Skip if dest_rse is blocklisted for write or src_rse is blocklisted for read
@@ -468,3 +476,6 @@ def _handle_requests(release_groups, logger):
                 rse_expression = limit_stat['limit']['rse_expression']
                 limit_stat['stat']['residual_capacity'] -= total_released
                 METRICS.counter('released_waiting_requests.{activity}.{rse}').labels(activity=activity, rse=rse_expression).inc(total_released)
+        released_request_count += total_released
+
+    return released_request_count

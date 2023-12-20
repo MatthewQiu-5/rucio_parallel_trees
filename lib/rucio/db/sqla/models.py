@@ -29,7 +29,7 @@ from sqlalchemy.types import LargeBinary
 from rucio.common import utils
 from rucio.common.schema import get_schema_value
 from rucio.common.types import InternalAccount, InternalScope
-from rucio.db.sqla.constants import (AccountStatus, AccountType, DIDAvailability, DIDType, DIDReEvaluation,
+from rucio.db.sqla.constants import (AccountStatus, AccountType, CongestionState, DIDAvailability, DIDType, DIDReEvaluation,
                                      KeyType, IdentityType, LockState, RuleGrouping, BadFilesStatus,
                                      RuleState, ReplicaState, RequestState, RequestType, RSEType,
                                      ScopeStatus, SubscriptionState, RuleNotification, LifetimeExceptionsState,
@@ -1239,6 +1239,16 @@ class UpdatedAccountCounter(BASE, ModelBase):
                    ForeignKeyConstraint(['account'], ['accounts.account'], name='UPDATED_ACCNT_CNTRS_ACCOUNT_FK'),
                    Index('UPDATED_ACCNT_CNTRS_RSE_ID_IDX', 'account', 'rse_id'))
 
+class Congestion(BASE, ModelBase):
+    """Represents the statistics needed to perform congestion control calculations"""
+    __tablename__ = 'congestion'
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), default=utils.generate_uuid, primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utils.current_dt)
+    window_size: Mapped[int] = mapped_column(Integer())
+    max_window_size: Mapped[int] = mapped_column(Integer())
+    state: Mapped[Optional[CongestionState]] = mapped_column(Enum(CongestionState))
+    initial_request_count: Mapped[Optional[int]] = mapped_column(Integer())
+    _table_args = ()
 
 class Request(BASE, ModelBase):
     """Represents a request for a single file with a third party service"""

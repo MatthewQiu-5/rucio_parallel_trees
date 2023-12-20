@@ -27,12 +27,12 @@ from collections.abc import Sequence, Mapping, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-from sqlalchemy import and_, or_, update, select, delete, exists, insert
+from sqlalchemy import and_, or_, update, select, delete, exists, insert, desc
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.expression import asc, true, false, null, func
 
-from rucio.common.config import config_get_bool, config_get_int
+from rucio.common.config import config_get_bool, config_get_int, config_get_float
 from rucio.common.exception import RequestNotFound, RucioException, UnsupportedOperation, InvalidRSEExpression
 from rucio.common.types import InternalAccount, InternalScope
 from rucio.common.utils import generate_uuid, chunks
@@ -42,7 +42,7 @@ from rucio.core.monitor import MetricManager
 from rucio.core.rse import get_rse_attribute, get_rse_name, get_rse_vo, RseData, RseCollection
 from rucio.core.rse_expression_parser import parse_expression
 from rucio.db.sqla import models, filter_thread_work
-from rucio.db.sqla.constants import RequestState, RequestType, LockState, RequestErrMsg, ReplicaState, TransferLimitDirection
+from rucio.db.sqla.constants import RequestState, RequestType, LockState, RequestErrMsg, ReplicaState, TransferLimitDirection, CongestionState
 from rucio.db.sqla.session import read_session, transactional_session, stream_session
 from rucio.db.sqla.util import temp_table_mngr
 
@@ -2853,3 +2853,160 @@ def reset_stale_waiting_requests(time_limit: Optional[datetime.timedelta] = date
 
     except IntegrityError as error:
         raise RucioException(error.args)
+
+
+@transactional_session
+def conduct_resubmissions(
+        *,
+        session: "Session"
+) -> int:
+    """
+    Computes resubmissions using the window size computed at the last iteration
+    :param session: The database session in use
+    :return: The number of resubmissions
+    """
+
+    try:
+        # Get initial waiting requests
+        stmt = select(
+            models.Request
+        ).where(
+            models.Request.state == RequestState.WAITING
+        ).execution_options(
+            synchronize_session=False
+        )
+        requests = session.execute(stmt).all()
+        initial_request_count = len(requests)
+
+        # Get latest congestion state
+        stmt = select(
+            models.Congestion
+        ).order_by(
+            models.Congestion.timestamp.desc()
+        ).limit(1)
+        latest_congestion_state = session.execute(stmt).first()
+
+        # First iteration
+        if latest_congestion_state is None:
+            latest_congestion_state = models.Congestion(
+                window_size=10,
+                max_window_size=10,
+                initial_request_count=initial_request_count,
+                timestamp=datetime.datetime.now()
+            )
+            session.add(
+                latest_congestion_state
+            )
+            resubmissions = initial_request_count - 10
+        else:
+            latest_congestion_state = latest_congestion_state[0]
+            keep_request_window = latest_congestion_state.window_size
+            resubmissions = initial_request_count - keep_request_window
+            latest_congestion_state.initial_request_count = initial_request_count
+
+        # Do resubmissions
+        if resubmissions > 0:
+            subquery = select(
+                models.Request.id
+            ).order_by(
+                desc(models.Request.last_processed_at)
+            ).limit(resubmissions)
+
+            request_id_list = [req[0] for req in session.execute(subquery).all()]
+            resubmit_query = (
+                update(
+                    models.Request
+                ).values(
+                    {
+                        models.Request.source_rse_id: None,
+                        models.Request.state: RequestState.PREPARING
+                    }
+                ).where(models.Request.id.in_(request_id_list))
+            )
+            session.execute(resubmit_query)
+
+        return max(resubmissions, 0)
+
+    except IntegrityError as error:
+        raise RucioException(error.args)
+
+
+@transactional_session
+def adjust_resubmission_window(
+        released_request_count: int,
+        sleep_time: int,
+        *,
+        session: "Session"
+) -> None:
+    """
+    Adjusts the resubmission window based on the result of the current resubmission window
+    :param released_request_count: The number of requests released by the throttler
+    :param sleep_time: The time in between intervals of the throttler daemon
+    """
+
+    # Get latest congestion state
+    stmt = select(
+        models.Congestion
+    ).order_by(
+        desc(models.Congestion.timestamp)
+    ).limit(1)
+    last_congestion_state = session.execute(stmt).first()[0]
+
+    current_cwnd = last_congestion_state.window_size
+    max_cwnd = last_congestion_state.max_window_size
+
+    # Get beta, constant factor, and threshold
+    beta = config_get_float('congestion', 'beta', default=0.7)
+    constant = config_get_float('congestion', 'constant', default=0.4)
+
+    # Get timestamp of last loss
+    stmt = select(
+        models.Congestion
+    ).where(
+        models.Congestion.state == CongestionState.LOSS
+    ).order_by(
+        desc(
+            models.Congestion.timestamp
+        )
+    ).limit(1)
+    last_loss_timestamp = session.execute(stmt).first()
+
+    if last_loss_timestamp is None:
+        # Get earliest timestamp
+        stmt = select(
+            models.Congestion
+        ).order_by(
+            models.Congestion.timestamp
+        ).limit(1)
+        first_congestion_state = session.execute(stmt).first()[0]
+        T = (datetime.datetime.now() - first_congestion_state.timestamp).total_seconds()
+
+    else:
+        last_loss_timestamp = last_loss_timestamp[0].timestamp
+        T = (datetime.datetime.now() - last_loss_timestamp).total_seconds()
+
+    def cubic(congestion_state):
+        K = (max_cwnd * (1-beta))**(1/3)
+        congestion_window = constant * ((T - K)**3) + max_cwnd
+        return congestion_window
+
+    # initial request count get
+    initial_request_count = last_congestion_state.initial_request_count
+
+    # Determine congestion avoidance or loss
+    if released_request_count < last_congestion_state.initial_request_count:
+        new_window_size = beta * current_cwnd
+        new_state = models.Congestion(window_size=new_window_size,
+                                      max_window_size=last_congestion_state.window_size,
+                                      state=CongestionState.LOSS,
+                                      initial_request_count=initial_request_count)
+
+    else:
+        rtt = (datetime.datetime.now() - last_congestion_state.timestamp).total_seconds()
+        t = T
+        new_cwnd = current_cwnd + ((cubic(t+rtt) - current_cwnd) / current_cwnd)
+        new_state = models.Congestion(window_size=new_cwnd,
+                                      max_window_size=last_congestion_state.window_size,
+                                      state=CongestionState.CONGESTION_AVOIDANCE,
+                                      initial_request_count=initial_request_count)
+    session.add(new_state)
